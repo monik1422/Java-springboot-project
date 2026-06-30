@@ -1,150 +1,116 @@
-name: Deploy Backend to EC2
+name: Deploy Backend (self-hosted + OIDC)
 
+# Runs on the self-hosted runner installed on the EC2 box.
 on:
-  push:
-    branches:
-      - main
+  # push:
+  #   branches: [ main ]
+  workflow_dispatch:   # ✅ manual trigger only
+
+# OIDC: the job mints a short-lived token GitHub -> AWS STS. No stored keys.
+permissions:
+  id-token: write      # required to request the OIDC token
+  contents: read       # required for actions/checkout
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}            # repo Variable, e.g. us-east-1
+  DB_SECRET_NAME: ${{ vars.DB_SECRET_NAME }}    # repo Variable, e.g. datastore/db
+  DEPLOY_DIR: /home/ec2-user/app/backend
+  JAR_NAME: datastore-0.0.7.jar
+  APP_PORT: "8084"
 
 jobs:
   build-deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted          # <-- runs ON the EC2 instance, no SSH/key pair
     steps:
-      # 1️⃣ Checkout code
-      - name: Checkout Repository
+      # 1) Pull the repo into the runner's workspace.
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2️⃣ Prepare EC2 (install Java, Maven, Git)
-      - name: Prepare EC2
-        uses: appleboy/ssh-action@v1.1.0
+      # 2) Assume the AWS role via OIDC (no access keys anywhere).
+      #    Sets temporary AWS_* env vars for the steps that follow.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
-            sudo yum install -y git maven java-17-amazon-corretto -y
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}   # repo Variable (role ARN)
+          aws-region: ${{ env.AWS_REGION }}
 
-      # 3️⃣ Clone or pull repo on EC2
-      - name: Clone / Pull Repository
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
-            APP_DIR=/home/ec2-user/app
-            REPO_NAME=Java-springboot-project
-            REPO_URL=https://github.com/CloudTechDevOps/Java-springboot-project.git
-            mkdir -p $APP_DIR
-            cd $APP_DIR
-            if [ -d "$REPO_NAME/.git" ]; then
-              cd $REPO_NAME
-              git reset --hard
-              git pull origin main
-            else
-              git clone $REPO_URL
-              cd $REPO_NAME
-            fi
+      # 3) Build the Spring Boot fat jar.
+      - name: Build jar
+        run: |
+          cd backend
+          mvn clean package -DskipTests -U
 
-      # 4️⃣ Build Maven app
-      - name: Build Maven Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
-            cd /home/ec2-user/app/Java-springboot-project/backend
-            mvn clean package -DskipTests -U
+      # 4) Copy the jar to a stable path (the runner workspace is wiped between
+      #    runs, so systemd must point somewhere permanent).
+      - name: Deploy jar to stable path
+        run: |
+          mkdir -p "$DEPLOY_DIR"
+          cp "backend/target/${JAR_NAME}" "${DEPLOY_DIR}/${JAR_NAME}"
 
-      # 5️⃣ Stop old application safely
-      - name: Stop Old Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script_stop: false
-          script: |
-            PIDS=$(pgrep -f "java.*datastore-0.0.7.jar"  true)
-            if [ -n "$PIDS" ]; then
-              echo "Stopping application PIDs: $PIDS"
-              kill $PIDS  true
-              sleep 5
-              for PID in $PIDS; do
-                if ps -p $PID > /dev/null; then
-                  echo "Force killing PID $PID"
-                  kill -9 $PID  true
-                fi
-              done
-            else
-              echo "No running application found"
-            fi
+      # 5) Fetch DB creds from Secrets Manager (using the OIDC role) and write
+      #    them to a root-owned, chmod 600 EnvironmentFile for systemd.
+      - name: Fetch DB credentials from Secrets Manager
+        run: |
+          sudo dnf install -y jq >/dev/null 2>&1 || true
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$DB_SECRET_NAME" \
+            --query SecretString --output text)
+          MYSQL_HOST=$(echo "$SECRET_JSON" | jq -r '.MYSQL_HOST')
+          MYSQL_USERNAME=$(echo "$SECRET_JSON" | jq -r '.MYSQL_USERNAME')
+          MYSQL_PASSWORD=$(echo "$SECRET_JSON" | jq -r '.MYSQL_PASSWORD')
+          echo "::add-mask::$MYSQL_PASSWORD"
+          sudo mkdir -p /var/log/app
+          sudo chown ec2-user:ec2-user /var/log/app
+          sudo tee /etc/datastore.env >/dev/null <<EOF
+          MYSQL_HOST=${MYSQL_HOST}
+          MYSQL_PORT=3306
+          MYSQL_USERNAME=${MYSQL_USERNAME}
+          MYSQL_PASSWORD=${MYSQL_PASSWORD}
+          LOG_FILE_PATH=/var/log/app/datastore.log
+          EOF
+          sudo chown root:root /etc/datastore.env
+          sudo chmod 600 /etc/datastore.env
 
-      # 6️⃣ Start new application
-      - name: Start Application
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
-            LOG_DIR=/var/log/app
-            sudo mkdir -p $LOG_DIR
-            sudo chown ec2-user:ec2-user $LOG_DIR
-            cd /home/ec2-user/app/Java-springboot-project/backend/target
-            nohup env \
-              MYSQL_HOST=${{ secrets.DB_HOST }} \
-              MYSQL_PORT=3306 \
-              MYSQL_USERNAME=${{ secrets.DB_USERNAME }} \
-              MYSQL_PASSWORD=${{ secrets.DB_PASSWORD }} \
-              LOG_FILE_PATH=$LOG_DIR/datastore.log \
-              java -jar datastore-0.0.7.jar \
-              --server.port=8084 \
-              > $LOG_DIR/nohup.out 2>&1 &
+      # 6) Install / refresh the systemd unit.
+      - name: Install systemd unit
+        run: |
+          sudo tee /etc/systemd/system/datastore.service >/dev/null <<EOF
+          [Unit]
+          Description=DataStore Spring Boot Backend
+          After=network.target
 
-      # 7️⃣ Wait for app startup
-      - name: Wait for App Startup
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            echo "Waiting 15 seconds for application to start..."
-            sleep 15
-      # 8️⃣ Verify DB connectivity via actuator
-      - name: Verify DB Connection
-        uses: appleboy/ssh-action@v1.1.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_KEY }}
-          script: |
-            set -e
-            HEALTH=$(curl -s http://localhost:8084/actuator/health)
-            echo "Health endpoint response: $HEALTH"
-      
-            # Check only app status
-            if [[ "$HEALTH" != *'"status":"UP"'* ]]; then
-              echo "❌ Application not UP!"
-              exit 1
-            fi
-      
-            # Optional DB check (non-blocking)
-            if [[ "$HEALTH" == *'"db"'* ]]; then
-              if [[ "$HEALTH" != *'"status":"UP"'* ]]; then
-                echo "❌ DB not UP!"
-                exit 1
-              fi
-              echo "✅ DB is UP"
-            else
-              echo "⚠️ DB health not exposed, skipping check"
-            fi
-      
-            echo "✅ Application is UP"
-      
-            echo "✅ Application and DB are UP"
+          [Service]
+          User=ec2-user
+          WorkingDirectory=${DEPLOY_DIR}
+          EnvironmentFile=/etc/datastore.env
+          ExecStart=/usr/bin/java -jar ${DEPLOY_DIR}/${JAR_NAME} --server.port=${APP_PORT}
+          SuccessExitStatus=143
+          Restart=always
+          RestartSec=5
+          StandardOutput=append:/var/log/app/datastore.out
+          StandardError=append:/var/log/app/datastore.out
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+      # 7) Reload, clear failed state, restart.
+      - name: Reload & restart
+        run: |
+          sudo systemctl daemon-reload
+          sudo systemctl enable datastore
+          sudo systemctl reset-failed datastore || true
+          sudo systemctl restart datastore
+
+      # 8) Confirm the app reports healthy.
+      - name: Health check
+        run: |
+          for i in $(seq 1 12); do
+            H=$(curl -s "http://localhost:${APP_PORT}/actuator/health" || true)
+            if [[ "$H" == *'"status":"UP"'* ]]; then echo "Application UP: $H"; exit 0; fi
+            echo "Attempt $i: not up yet, retrying in 5s..."; sleep 5
+          done
+          echo "Application did not become healthy. Recent logs:"
+          sudo systemctl status datastore --no-pager || true
+          sudo tail -n 50 /var/log/app/datastore.out || true
+          exit 1
